@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/comic.py": {
+      "memory": 128,
+      "maxDuration": 10
+    }
+  }
+}
