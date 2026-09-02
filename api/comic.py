@@ -44,7 +44,7 @@ def pick_strip(date_str: str, attempt: int = 0):
     rnd = random.Random(f"{date_str}-{attempt}")
     comic = rnd.choice(COMICS)
     month, day = date_str[5:7], date_str[8:10]
-    year = rnd.randint(comic["start"], comic["end"])
+    year = date_str[0:4] #rnd.randint(comic["start"], comic["end"])
     page_url = f"https://www.gocomics.com/{comic['slug']}/{year}/{month}/{day}"
     return comic, page_url
 
