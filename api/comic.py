@@ -1,23 +1,43 @@
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from flask import Flask, request, Response
 import urllib.request
+import urllib.error
 import re
 import random
 import datetime
+import xml.etree.ElementTree as ET
 
-# Add/remove comics here. "slug" is the part of the URL after gocomics.com/
-# "start"/"end" is the range of years that comic actually ran (so we don't
-# pick a date it never published on). Update "end" occasionally for comics
-# still running.
+app = Flask(__name__)
+
+# Sourced from comicsrss.com (https://www.comicsrss.com/), which publishes
+# pre-generated static RSS feeds — no live scraping against the original
+# publishers happens here, which sidesteps both GoComics' bot protection
+# and (more importantly) their stated objection to RSS mirroring of their
+# content. These are all Comics Kingdom / Arcamax / dilbert.com sourced,
+# none from GoComics.
+#
+# Add more by checking https://www.comicsrss.com/ for a "Copy RSS URL"
+# link — the slug is the part before ".rss".
 COMICS = [
-    {"name": "Calvin and Hobbes", "slug": "calvinandhobbes", "start": 1985, "end": 1995},
-    {"name": "Garfield", "slug": "garfield", "start": 1978, "end": 2025},
-    {"name": "Peanuts", "slug": "peanuts", "start": 1950, "end": 2000},
-    {"name": "The Far Side", "slug": "farside", "start": 1980, "end": 1994},
-    {"name": "FoxTrot", "slug": "foxtrot", "start": 1988, "end": 2006},
-    {"name": "Pearls Before Swine", "slug": "pearlsbeforeswine", "start": 2002, "end": 2025},
-    {"name": "Get Fuzzy", "slug": "getfuzzy", "start": 1999, "end": 2019},
-    {"name": "Non Sequitur", "slug": "nonsequitur", "start": 1992, "end": 2025},
+    {"name": "Dilbert", "slug": "dilbert"},
+    {"name": "Beetle Bailey", "slug": "beetle-bailey-1"},
+    {"name": "Beetle Bailey (Arcamax)", "slug": "beetlebailey"},
+    {"name": "Blondie", "slug": "blondie"},
+    {"name": "Hagar the Horrible", "slug": "hagarthehorrible"},
+    {"name": "Hi and Lois", "slug": "hiandlois"},
+    {"name": "Dennis the Menace", "slug": "dennisthemenace"},
+    {"name": "Family Circus", "slug": "familycircus"},
+    {"name": "Mallard Fillmore", "slug": "mallardfillmore"},
+    {"name": "Judge Parker", "slug": "judge-parker"},
+    {"name": "Flash Gordon", "slug": "flash-gordon"},
+    {"name": "Barney Google and Snuffy Smith", "slug": "barney-google-and-snuffy-smith"},
+    {"name": "Barney Google and Snuffy Smith (Arcamax)", "slug": "barneygoogle"},
+    {"name": "Kevin and Kell", "slug": "kevin-and-kell"},
+    {"name": "Crock", "slug": "crock"},
+    {"name": "Archie", "slug": "archie"},
+    {"name": "Arctic Circle", "slug": "arcticcircle"},
+    {"name": "Candorville", "slug": "candorville"},
+    {"name": "The Dinette Set", "slug": "thedinetteset"},
+    {"name": "Dustin", "slug": "dustin"},
 ]
 
 HEADERS = {
@@ -27,40 +47,62 @@ HEADERS = {
     )
 }
 
-OG_IMAGE_RE = re.compile(r'<meta property="og:image" content="([^"]+)"')
+BASE_URL = "https://www.comicsrss.com/rss"
+IMG_SRC_RE = re.compile(r'<img[^>]+src="([^"]+)"')
 
 
-def fetch_og_image(url: str):
+def fetch(url: str) -> str:
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
-    match = OG_IMAGE_RE.search(html)
-    return match.group(1) if match else None
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+
+def extract_image_from_item(item_el):
+    enclosure = item_el.find("enclosure")
+    if enclosure is not None and enclosure.get("url"):
+        return enclosure.get("url")
+    for child in item_el:
+        if child.tag.endswith("content") and child.get("url"):
+            return child.get("url")
+    description = item_el.find("description")
+    if description is not None and description.text:
+        match = IMG_SRC_RE.search(description.text)
+        if match:
+            return match.group(1)
+    return None
 
 
 def pick_strip(date_str: str, attempt: int = 0):
-    """Deterministic-per-day pick, but nudge the seed on retry so a dead
-    link doesn't just fail silently."""
     rnd = random.Random(f"{date_str}-{attempt}")
-    comic = rnd.choice(COMICS)
-    month, day = date_str[5:7], date_str[8:10]
-    year = date_str[0:4] #rnd.randint(comic["start"], comic["end"])
-    page_url = f"https://www.gocomics.com/{comic['slug']}/{year}/{month}/{day}"
-    return comic, page_url
+    return rnd.choice(COMICS)
 
 
 def get_comic_image(date_str: str):
-    last_page_url = None
-    for attempt in range(5):
-        comic, page_url = pick_strip(date_str, attempt)
-        last_page_url = page_url
+    tried = []
+    for attempt in range(len(COMICS)):
+        strip = pick_strip(date_str, attempt)
+        if strip["name"] in tried:
+            continue
+        tried.append(strip["name"])
+        feed_url = f"{BASE_URL}/{strip['slug']}.rss"
         try:
-            img_url = fetch_og_image(page_url)
+            xml_text = fetch(feed_url)
+            root = ET.fromstring(xml_text)
+            channel = root.find("channel")
+            items = channel.findall("item") if channel is not None else []
+            if not items:
+                continue
+            latest = items[0]
+            title = latest.findtext("title", default="")
+            if "no longer updated" in title.lower() or "no more comics" in title.lower():
+                continue
+            img_url = extract_image_from_item(latest)
+            if img_url:
+                source_link = latest.findtext("link", default=feed_url)
+                return strip, source_link, img_url
         except Exception:
-            img_url = None
-        if img_url:
-            return comic, page_url, img_url
-    return None, last_page_url, None
+            continue
+    return None, None, None
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -105,31 +147,29 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 FALLBACK_TEMPLATE = """<!DOCTYPE html>
 <html><body style="font-family:sans-serif;display:flex;align-items:center;
 justify-content:center;height:100vh;margin:0;color:#666;">
-Couldn't load a comic today. <a href="{page_url}">Try the source page</a>.
+Couldn't load a comic today. <a href="https://www.comicsrss.com">Browse comicsrss.com</a>.
 </body></html>
 """
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        qs = parse_qs(urlparse(self.path).query)
-        date_str = qs.get("date", [datetime.date.today().isoformat()])[0]
+@app.route("/api/comic")
+@app.route("/")
+def comic():
+    date_str = request.args.get("date", datetime.date.today().isoformat())
+    strip, page_url, img_url = get_comic_image(date_str)
 
-        comic, page_url, img_url = get_comic_image(date_str)
+    if img_url:
+        body = PAGE_TEMPLATE.format(
+            page_url=page_url,
+            img_url=img_url,
+            alt=strip["name"],
+            caption=f"{strip['name']} — via comicsrss.com",
+        )
+    else:
+        body = FALLBACK_TEMPLATE
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "public, max-age=3600")
-        self.end_headers()
+    return Response(body, mimetype="text/html", headers={"Cache-Control": "public, max-age=3600"})
 
-        if img_url:
-            body = PAGE_TEMPLATE.format(
-                page_url=page_url,
-                img_url=img_url,
-                alt=comic["name"],
-                caption=f"{comic['name']} — via GoComics",
-            )
-        else:
-            body = FALLBACK_TEMPLATE.format(page_url=page_url or "https://www.gocomics.com")
 
-        self.wfile.write(body.encode("utf-8"))
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
